@@ -1,0 +1,118 @@
+name: Install LLM Literature Audit v0.1.0
+
+on:
+  push:
+    branches:
+      - feat/public-v0.1.0
+    paths:
+      - .github/workflows/install-public-v010.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: llm-literature-audit-source-installer
+  cancel-in-progress: false
+
+jobs:
+  install:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/public-v0.1.0
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download the previously verified recovery archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=/tmp/llm-literature-audit-source.tar.xz
+          urls=(
+            'https://drive.usercontent.google.com/download?id=1pFQ3Ys0p-3MDftTIDT__eDaHnlPN5y2R&export=download&confirm=t'
+            'https://drive.google.com/uc?export=download&id=1pFQ3Ys0p-3MDftTIDT__eDaHnlPN5y2R&confirm=t'
+          )
+          for url in "${urls[@]}"; do
+            if curl --location --fail --silent --show-error --retry 2 --connect-timeout 20 --max-time 120 "$url" --output "$archive"; then
+              if echo '9fb75ac99bf97ab7554552c04f6a7a02ec75597389490bcb52de1760ca584265  /tmp/llm-literature-audit-source.tar.xz' | sha256sum --check --status; then
+                exit 0
+              fi
+            fi
+          done
+          echo 'Unable to retrieve the exact verified source archive.' >&2
+          exit 1
+
+      - name: Safely extract and install readable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/llm-literature-audit-extracted
+          mkdir -p /tmp/llm-literature-audit-extracted
+          python - <<'PY'
+          from __future__ import annotations
+
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          archive_path = Path('/tmp/llm-literature-audit-source.tar.xz')
+          destination = Path('/tmp/llm-literature-audit-extracted')
+          expected_root = 'llm-min'
+
+          with tarfile.open(archive_path, mode='r:xz') as archive:
+              members = archive.getmembers()
+              if not members:
+                  raise SystemExit('archive is empty')
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts:
+                      raise SystemExit(f'unsafe archive path: {member.name}')
+                  if not path.parts or path.parts[0] != expected_root:
+                      raise SystemExit(f'unexpected archive root: {member.name}')
+                  if member.issym() or member.islnk() or member.isdev():
+                      raise SystemExit(f'unsupported archive member: {member.name}')
+              archive.extractall(destination, filter='data')
+          PY
+          rsync -a --delete --exclude='.git/' /tmp/llm-literature-audit-extracted/llm-min/ ./
+
+      - name: Apply final packaging metadata and regenerate deterministic fixtures
+        shell: bash
+        env:
+          TERM: xterm
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          pyproject = Path('pyproject.toml')
+          text = pyproject.read_text(encoding='utf-8')
+          text = text.replace('license = {text = "MIT"}\n', 'license = "MIT"\nlicense-files = ["LICENSE"]\n')
+          text = text.replace('  "License :: OSI Approved :: MIT License",\n', '')
+          pyproject.write_text(text, encoding='utf-8')
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text(encoding='utf-8').replace(
+              '## [0.1.0] - 2026-09-01',
+              '## [0.1.0] - 2026-09-02',
+          )
+          changelog.write_text(text, encoding='utf-8')
+          PY
+          python tools/generate_examples.py
+          python tools/release_check.py
+
+      - name: Commit only the clean readable repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .bootstrap
+          test ! -e .github/workflows/install-public-v010.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: publish evidence-preserving LLM literature audit toolkit'
+          git push origin HEAD:feat/public-v0.1.0
